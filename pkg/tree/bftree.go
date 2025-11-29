@@ -6,10 +6,10 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/jeremytregunna/bftree/internal/buffer"
-	"github.com/jeremytregunna/bftree/internal/merger"
-	"github.com/jeremytregunna/bftree/internal/node"
-	"github.com/jeremytregunna/bftree/internal/storage"
+	"github.com/jeremytregunna/bftree/pkg/buffer"
+	"github.com/jeremytregunna/bftree/pkg/merger"
+	"github.com/jeremytregunna/bftree/pkg/node"
+	"github.com/jeremytregunna/bftree/pkg/storage"
 )
 
 // BfTree is the main B-Tree structure optimized for read-write workloads.

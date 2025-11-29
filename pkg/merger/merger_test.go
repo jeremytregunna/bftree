@@ -5,8 +5,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/jeremytregunna/bftree/internal/node"
-	"github.com/jeremytregunna/bftree/internal/storage"
+	"github.com/jeremytregunna/bftree/pkg/node"
+	"github.com/jeremytregunna/bftree/pkg/storage"
 )
 
 func TestMergeSimple(t *testing.T) {

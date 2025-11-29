@@ -3,8 +3,8 @@ package merger
 import (
 	"fmt"
 
-	"github.com/jeremytregunna/bftree/internal/node"
-	"github.com/jeremytregunna/bftree/internal/storage"
+	"github.com/jeremytregunna/bftree/pkg/node"
+	"github.com/jeremytregunna/bftree/pkg/storage"
 )
 
 // MergeResult contains the result of merging a mini-page with a leaf page

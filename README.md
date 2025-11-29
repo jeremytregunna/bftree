@@ -32,7 +32,7 @@ BfTree
 ```go
 package main
 
-import "github.com/jeremytregunna/bftree/internal/tree"
+import "github.com/jeremytregunna/bftree/pkg/tree"
 
 func main() {
     // Create a tree with 256KB buffer and storage file
