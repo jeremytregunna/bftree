@@ -9,10 +9,11 @@ https://vldb.org/pvldb/vol17/p3442-hao.pdf
 
 The Bf-Tree is a B-Tree variant optimized for modern hardware and read-write workloads. Key features:
 
+- **Generic type system**: Fully generic over `BfTree[K, V]` using Go 1.18+ generics
+- **Codecs pattern**: Pluggable comparison and serialization functions for any key-value types
 - **Mini-pages**: Variable-sized in-memory record buffers that separate recent updates from disk pages
 - **Circular buffer management**: All mini-page data lives in a managed circular buffer with automatic eviction
 - **Lazy merging**: Mini-pages are merged with disk pages on demand or when memory pressure rises
-- **No heap escapes**: Mini-page key-value data uses manual offset tracking to avoid Go slice append() escapes
 - **Optimistic latch coupling**: Read locks on inner nodes using version-based validation
 
 ## Architecture
@@ -29,62 +30,82 @@ BfTree
 
 ## Usage
 
+The Bf-Tree is generic and works with any key-value types. You provide a `Codecs` struct with comparison and serialization functions:
+
 ```go
 package main
 
-import "github.com/jeremytregunna/bftree/pkg/tree"
+import (
+    "github.com/jeremytregunna/bftree/pkg/node"
+    "github.com/jeremytregunna/bftree/pkg/tree"
+)
 
 func main() {
-    // Create a tree with 256KB buffer and storage file
-    t, err := tree.NewBfTree(256*1024, "tree.db")
+    // Create codecs for string keys and values
+    codecs := &node.Codecs[string, string]{
+        Compare: func(a, b string) int {
+            if a < b { return -1 }
+            if a > b { return 1 }
+            return 0
+        },
+        MarshalKey:     func(k string) []byte { return []byte(k) },
+        UnmarshalKey:   func(b []byte) (string, error) { return string(b), nil },
+        MarshalValue:   func(v string) []byte { return []byte(v) },
+        UnmarshalValue: func(b []byte) (string, error) { return string(b), nil },
+    }
+
+    // Create tree with 256KB buffer
+    t, err := tree.NewBfTree[string, string](256*1024, "tree.db", codecs)
     if err != nil {
         panic(err)
     }
     defer t.Close()
 
     // Insert key-value pairs
-    t.Insert([]byte("key1"), []byte("value1"))
-    t.Insert([]byte("key2"), []byte("value2"))
+    t.Insert("key1", "value1")
+    t.Insert("key2", "value2")
 
     // Retrieve values
-    value, err := t.Get([]byte("key1"))
+    value, err := t.Get("key1")
     if err == nil {
-        println(string(value))
+        println(value)
     }
 
     // Range scan
-    records, err := t.Scan([]byte("key1"), []byte("key3"))
+    records, err := t.Scan("key1", "key3")
     for _, rec := range records {
-        println(string(rec.Key), string(rec.Value))
+        println(rec.Key, rec.Value)
     }
 
     // Delete (soft delete via tombstone)
-    t.Delete([]byte("key1"))
+    t.Delete("key1")
 
     // Update
-    t.Update([]byte("key2"), []byte("newvalue"))
+    t.Update("key2", "newvalue")
 }
 ```
 
 ## Implementation Details
 
-- **Mini-pages**: Fixed-capacity buffers allocated from circular buffer. Data uses `kvDataLen` tracking instead of slice length to prevent heap escapes.
-- **Buffer allocation**: Mini-pages allocate from `CircularBuffer.Alloc()` with automatic eviction on pressure.
-- **Growth strategy**: When a mini-page grows, it reallocates a larger chunk from the buffer, copies used data, and deallocates the old chunk.
-- **Eviction**: Dirty mini-pages are merged to disk via the merger, and their buffer chunks are returned to the free lists.
-- **Memory efficiency**: Only active mini-pages live in memory; older updates are persisted to disk.
+- **Generics architecture**: All components generic - `InnerNode[K]`, `MiniPage[K, V]`, `BfTree[K, V]`, `Merger[K, V]`
+- **Codecs pattern**: Separation of key comparison from serialization. Codecs struct provides `Compare`, `MarshalKey`, `UnmarshalKey`, `MarshalValue`, `UnmarshalValue`
+- **Mini-pages**: Typed key-value storage with Record types (Insert, Cache, Tombstone, Phantom)
+- **Buffer allocation**: Mini-pages allocate from `CircularBuffer.Alloc()` with automatic eviction on pressure
+- **Merger strategy**: Deserializes disk pages using codecs, merges with in-memory records, re-serializes for disk storage
+- **Memory efficiency**: Only active mini-pages live in memory; older updates are persisted to disk
 
 ## Testing
 
-All 23 tests pass, including:
-- Basic operations (Insert, Get, Delete, Update, Scan)
+All 20+ tests pass with the generic type system, including:
+- Basic operations with string codecs (Insert, Get, Delete, Update, Scan)
+- Merger operations (simple merge, delete merge, split merge)
 - Disk persistence and merging
 - Buffer allocation and eviction
 - Verification that mini-page data actually lives in the circular buffer
 
 Run tests with:
 ```bash
-go test ./...
+go test ./pkg/...
 ```
 
 ## Status
