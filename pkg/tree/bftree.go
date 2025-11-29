@@ -1,7 +1,6 @@
 package tree
 
 import (
-	"encoding/binary"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -12,10 +11,10 @@ import (
 	"github.com/jeremytregunna/bftree/pkg/storage"
 )
 
-// BfTree is the main B-Tree structure optimized for read-write workloads.
-type BfTree struct {
+// BfTree is a generic Buffer-efficient B-Tree for key-value storage.
+type BfTree[K, V any] struct {
 	// Root node (pinned in memory)
-	root *node.InnerNode
+	root *node.InnerNode[K]
 
 	// Buffer pool for mini-pages
 	bufferPool *buffer.CircularBuffer
@@ -30,7 +29,7 @@ type BfTree struct {
 	store *storage.Storage
 
 	// Merger for combining mini-pages with disk pages
-	m *merger.Merger
+	m *merger.Merger[K, V]
 
 	// Next page ID counter
 	nextPageID uint64
@@ -44,49 +43,52 @@ type BfTree struct {
 	// Total size of all mini-pages in memory for eviction tracking
 	totalMiniPageSize uint64
 
+	// Codecs for serialization
+	codecs *node.Codecs[K, V]
+
 	// Global lock for tree modifications
 	treeMu sync.RWMutex
 }
 
-// NewBfTree creates a new Bf-Tree with the given buffer size and storage file.
-func NewBfTree(bufferSizeBytes uint64, storePath string) (*BfTree, error) {
+// NewBfTree creates a new generic Bf-Tree with given buffer size and storage file.
+func NewBfTree[K, V any](bufferSizeBytes uint64, storePath string, codecs *node.Codecs[K, V]) (*BfTree[K, V], error) {
 	// Create storage
 	store, err := storage.NewStorage(storePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create storage: %w", err)
 	}
 
-	tree := &BfTree{
-		root:           node.NewInnerNode(),
+	tree := &BfTree[K, V]{
+		root:           node.NewInnerNode(codecs.Compare),
 		bufferPool:     buffer.NewCircularBuffer(bufferSizeBytes),
 		bufferPoolSize: bufferSizeBytes,
 		mappingTable:   NewMappingTable(),
 		store:          store,
-		m:              merger.NewMerger(store),
-		nextPageID:     1, // Start page IDs from 1
+		m:              merger.NewMerger(store, codecs),
+		nextPageID:     1,
+		codecs:         codecs,
 	}
 
 	// Initialize root with first leaf page
 	leafPageID := tree.allocatePageID()
-	tree.mappingTable.Insert(leafPageID, 0) // Location 0 is disk offset
-
-	// Add leaf page ID to root
+	tree.mappingTable.Insert(leafPageID, 0)
 	tree.root.LeafPageIDs[0] = leafPageID
 
 	return tree, nil
 }
 
 // Get retrieves a value for the given key.
-func (t *BfTree) Get(key []byte) ([]byte, error) {
+func (t *BfTree[K, V]) Get(key K) (V, error) {
 	// Traverse the tree to find the leaf page
 	leafPageID := t.traverse(key)
 	if leafPageID == 0 {
-		return nil, fmt.Errorf("key not found")
+		var zero V
+		return zero, fmt.Errorf("key not found")
 	}
 
 	// Check mini-page first
 	if mp, ok := t.miniPages.Load(leafPageID); ok {
-		if value, found := mp.(*node.MiniPage).Search(key); found {
+		if value, found := mp.(*node.MiniPage[K, V]).Search(key); found {
 			return value, nil
 		}
 	}
@@ -94,45 +96,42 @@ func (t *BfTree) Get(key []byte) ([]byte, error) {
 	// Load from disk if not in mini-page
 	mapEntry := t.mappingTable.Get(leafPageID)
 	if mapEntry == nil {
-		return nil, fmt.Errorf("key not found")
+		var zero V
+		return zero, fmt.Errorf("key not found")
 	}
 
 	pageData, err := t.store.ReadPage(mapEntry.Location)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read page from disk: %w", err)
+		var zero V
+		return zero, fmt.Errorf("failed to read page from disk: %w", err)
 	}
 
 	// Parse records from page and search
-	offset := 0
-	for offset < len(pageData) {
-		k, v, newOffset, err := storage.ReadRecord(pageData, offset)
-		if err != nil {
-			if offset >= len(pageData)-4 {
-				break // End of page
-			}
-			return nil, fmt.Errorf("failed to read record: %w", err)
-		}
-		if len(k) == 0 {
-			break // Empty record signals end
-		}
-		if compare(k, key) == 0 {
-			return v, nil
-		}
-		offset = newOffset
+	records, err := t.m.ParseRecords(pageData)
+	if err != nil {
+		var zero V
+		return zero, err
 	}
 
-	return nil, fmt.Errorf("key not found")
+	for _, rec := range records {
+		if t.codecs.Compare(rec.Key, key) == 0 {
+			return rec.Value, nil
+		}
+	}
+
+	var zero V
+	return zero, fmt.Errorf("key not found")
 }
 
 // Insert inserts a key-value pair into the tree.
-func (t *BfTree) Insert(key, value []byte) error {
+func (t *BfTree[K, V]) Insert(key K, value V) error {
 	t.treeMu.Lock()
 	defer t.treeMu.Unlock()
 
-	// Traverse to find the leaf page
+	// Find leaf page
 	leafPageID := t.traverse(key)
 	if leafPageID == 0 {
-		return fmt.Errorf("invalid leaf page")
+		return fmt.Errorf("failed to traverse tree")
 	}
 
 	// Get or create mini-page
@@ -147,7 +146,6 @@ func (t *BfTree) Insert(key, value []byte) error {
 	if mp.Meta.NodeSize < 4096 {
 		newSize := mp.Meta.NodeSize * 2
 		if newSize > 4096 || newSize < mp.Meta.NodeSize {
-			// Cap at 4096 or prevent overflow
 			newSize = 4096
 		}
 		t.growMiniPageInBuffer(leafPageID, mp, newSize)
@@ -189,7 +187,7 @@ func (t *BfTree) Insert(key, value []byte) error {
 	// Try to insert the key into the appropriate page
 	targetMP := result.LeftPage
 	targetPageID := leafPageID
-	if result.RightPage != nil && compare(key, result.SplitKey) >= 0 {
+	if result.RightPage != nil && t.codecs.Compare(key, result.SplitKey) >= 0 {
 		targetMP = result.RightPage
 		targetPageID = rightPageID
 	}
@@ -214,58 +212,116 @@ func (t *BfTree) Insert(key, value []byte) error {
 }
 
 // Delete deletes a key from the tree by inserting a tombstone.
-func (t *BfTree) Delete(key []byte) error {
+func (t *BfTree[K, V]) Delete(key K) error {
 	t.treeMu.Lock()
 	defer t.treeMu.Unlock()
 
-	// Traverse to find the leaf page
 	leafPageID := t.traverse(key)
 	if leafPageID == 0 {
-		return fmt.Errorf("invalid leaf page")
+		return fmt.Errorf("key not found")
 	}
 
-	// Get or create mini-page
-	mp := t.getOrCreateMiniPage(leafPageID)
+	_ = t.getOrCreateMiniPage(leafPageID)
 
-	// Insert tombstone
-	mp.InsertWithType(key, nil, node.Tombstone)
+	var zeroValue V
+	return t.insertRecord(leafPageID, key, zeroValue, node.Tombstone)
+}
+
+// Update updates an existing key with a new value.
+func (t *BfTree[K, V]) Update(key K, value V) error {
+	t.treeMu.Lock()
+	defer t.treeMu.Unlock()
+
+	leafPageID := t.traverse(key)
+	if leafPageID == 0 {
+		return fmt.Errorf("key not found")
+	}
+
+	return t.insertRecord(leafPageID, key, value, node.Insert)
+}
+
+// Scan returns all records in the range [startKey, endKey).
+func (t *BfTree[K, V]) Scan(startKey, endKey K) ([]node.Record[K, V], error) {
+	t.treeMu.RLock()
+	defer t.treeMu.RUnlock()
+
+	var results []node.Record[K, V]
+
+	// Get starting leaf page
+	leafPageID := t.traverse(startKey)
+	if leafPageID == 0 {
+		return results, nil
+	}
+
+	// Scan all leaf pages in range
+	for leafPageID > 0 {
+		// Check mini-page
+		if mp, ok := t.miniPages.Load(leafPageID); ok {
+			recs := mp.(*node.MiniPage[K, V]).GetRecords()
+			for _, rec := range recs {
+				if t.codecs.Compare(rec.Key, startKey) >= 0 && t.codecs.Compare(rec.Key, endKey) < 0 {
+					results = append(results, rec)
+				}
+			}
+		}
+
+		// Check disk
+		mapEntry := t.mappingTable.Get(leafPageID)
+		if mapEntry != nil {
+			pageData, err := t.store.ReadPage(mapEntry.Location)
+			if err == nil {
+				recs, err := t.m.ParseRecords(pageData)
+				if err == nil {
+					for _, rec := range recs {
+						if t.codecs.Compare(rec.Key, startKey) >= 0 && t.codecs.Compare(rec.Key, endKey) < 0 {
+							results = append(results, rec)
+						}
+					}
+				}
+			}
+		}
+
+		// Move to next leaf page
+		idx := t.root.Search(startKey)
+		if idx+1 < len(t.root.LeafPageIDs) {
+			leafPageID = t.root.LeafPageIDs[idx+1]
+		} else {
+			break
+		}
+	}
+
+	return results, nil
+}
+
+// Close closes the tree and releases resources
+func (t *BfTree[K, V]) Close() error {
+	if t.store != nil {
+		return t.store.Close()
+	}
 	return nil
 }
 
-// Update updates a key-value pair in the tree.
-func (t *BfTree) Update(key, value []byte) error {
-	t.treeMu.Lock()
-	defer t.treeMu.Unlock()
+// Helper methods
 
-	// Traverse to find the leaf page
-	leafPageID := t.traverse(key)
-	if leafPageID == 0 {
-		return fmt.Errorf("invalid leaf page")
-	}
-
-	// Get or create mini-page
+func (t *BfTree[K, V]) insertRecord(leafPageID uint64, key K, value V, recType node.RecordType) error {
 	mp := t.getOrCreateMiniPage(leafPageID)
 
-	// Try to update in mini-page
-	if mp.InsertWithType(key, value, node.Insert) {
+	if mp.InsertWithType(key, value, recType) {
 		return nil
 	}
 
-	// Mini-page is full, try to grow it
 	if mp.Meta.NodeSize < 4096 {
 		newSize := mp.Meta.NodeSize * 2
 		if newSize > 4096 || newSize < mp.Meta.NodeSize {
-			// Cap at 4096 or prevent overflow
 			newSize = 4096
 		}
 		t.growMiniPageInBuffer(leafPageID, mp, newSize)
 
-		if mp.InsertWithType(key, value, node.Insert) {
+		if mp.InsertWithType(key, value, recType) {
 			return nil
 		}
 	}
 
-	// Mini-page too large, need to merge to disk
 	mapEntry := t.mappingTable.Get(leafPageID)
 	if mapEntry == nil {
 		return fmt.Errorf("leaf page mapping not found")
@@ -276,197 +332,61 @@ func (t *BfTree) Update(key, value []byte) error {
 		return fmt.Errorf("merge failed: %w", err)
 	}
 
-	// Update the merged mini-page
+	// Deallocate the old chunk
+	if oldChunkIface, ok := t.miniPageChunks.LoadAndDelete(leafPageID); ok {
+		t.bufferPool.Dealloc(oldChunkIface.(*buffer.MemoryChunk))
+	}
+
+	// Update the merged mini-page and handle splits
+	evictedSize := uint64(mp.Meta.NodeSize)
+	newSize := uint64(result.LeftPage.Meta.NodeSize)
+	atomic.AddUint64(&t.totalMiniPageSize, ^(evictedSize-1))
+	atomic.AddUint64(&t.totalMiniPageSize, newSize)
 	t.miniPages.Store(leafPageID, result.LeftPage)
 
-	// If split occurred, allocate new page ID and store right page
-	var rightPageID uint64
 	if result.RightPage != nil {
-		rightPageID = t.allocatePageID()
+		rightPageID := t.allocatePageID()
 		rightOffset := mapEntry.Location + uint64(storage.PageSize)
 		t.mappingTable.Insert(rightPageID, rightOffset)
 		t.miniPages.Store(rightPageID, result.RightPage)
-
-		// Update inner node to reflect the split
+		atomic.AddUint64(&t.totalMiniPageSize, uint64(result.RightPage.Meta.NodeSize))
 		t.root.InsertLeafPageSplit(result.SplitKey, rightPageID)
-
-		// Check if root needs to split
 		t.splitRootIfFull()
 	}
 
-	// Try to update the key into the appropriate page
-	targetMP := result.LeftPage
-	targetPageID := leafPageID
-	if result.RightPage != nil && compare(key, result.SplitKey) >= 0 {
-		targetMP = result.RightPage
-		targetPageID = rightPageID
-	}
-
-	if !targetMP.InsertWithType(key, value, node.Insert) {
-		// Page is full after merge, try to grow it
-		if targetMP.Meta.NodeSize < 4096 {
-			newSize := targetMP.Meta.NodeSize * 2
-			if newSize > 4096 || newSize < targetMP.Meta.NodeSize {
-				newSize = 4096
-			}
-			t.growMiniPageInBuffer(targetPageID, targetMP, newSize)
-
-			if !targetMP.InsertWithType(key, value, node.Insert) {
-				return fmt.Errorf("update failed after merge and grow: page full")
-			}
-		} else {
-			return fmt.Errorf("update failed after merge: page full and max size reached")
-		}
-	}
 	return nil
 }
 
-// Scan performs a range scan over keys in the given range [startKey, endKey).
-func (t *BfTree) Scan(startKey, endKey []byte) ([]node.Record, error) {
-	t.treeMu.RLock()
-	defer t.treeMu.RUnlock()
+func (t *BfTree[K, V]) traverse(key K) uint64 {
+	current := t.root
+	for len(current.Children) > 0 && current.Children[0] != nil {
+		idx := current.Search(key)
+		if idx >= len(current.Children) {
+			idx = len(current.Children) - 1
+		}
 
-	var results []node.Record
-	scanned := make(map[uint64]bool) // Track scanned pages to avoid duplicates
-
-	// Find the starting leaf page
-	leafPageID := t.traverse(startKey)
-	if leafPageID == 0 {
-		return results, fmt.Errorf("invalid leaf page")
-	}
-
-	// Get the starting index in root's leaf page array
-	startIndex := -1
-	for i, id := range t.root.LeafPageIDs {
-		if id == leafPageID {
-			startIndex = i
+		if current.Children[idx] != nil {
+			current = current.Children[idx]
+		} else {
 			break
 		}
 	}
-	if startIndex == -1 {
-		// Fallback: scan just the first page if we can't find it
-		startIndex = 0
+
+	if len(current.LeafPageIDs) > 0 {
+		idx := current.Search(key)
+		if idx >= len(current.LeafPageIDs) {
+			idx = len(current.LeafPageIDs) - 1
+		}
+		return current.LeafPageIDs[idx]
 	}
 
-	// Scan from the starting page through all relevant leaf pages
-	for pageIndex := startIndex; pageIndex < len(t.root.LeafPageIDs); pageIndex++ {
-		currentPageID := t.root.LeafPageIDs[pageIndex]
-		if scanned[currentPageID] {
-			continue // Skip if already scanned
-		}
-		scanned[currentPageID] = true
-
-		// Check if this page could contain records in our range
-		// We can stop scanning if the page's minimum key is >= endKey
-		// But since we don't track min keys, we conservatively scan all remaining pages
-		// until we find no more data in range
-
-		// Scan the mini-page if it exists
-		if mp, ok := t.miniPages.Load(currentPageID); ok {
-			miniPageRecords := mp.(*node.MiniPage).GetRecords()
-			for _, record := range miniPageRecords {
-				if compare(record.Key, startKey) >= 0 && compare(record.Key, endKey) < 0 {
-					results = append(results, record)
-				}
-			}
-		}
-
-		// Scan disk page if it exists
-		mapEntry := t.mappingTable.Get(currentPageID)
-		if mapEntry != nil && t.store != nil {
-			pageData, err := t.store.ReadPage(mapEntry.Location)
-			if err == nil {
-				offset := 0
-				for offset < len(pageData) {
-					k, v, newOffset, err := storage.ReadRecord(pageData, offset)
-					if err != nil {
-						if offset >= len(pageData)-4 {
-							break // End of page
-						}
-					}
-					if len(k) == 0 {
-						break // Empty record signals end
-					}
-
-					if compare(k, startKey) >= 0 && compare(k, endKey) < 0 {
-						// Check if this key is already in results
-						found := false
-						for _, r := range results {
-							if compare(r.Key, k) == 0 {
-								found = true
-								break
-							}
-						}
-						if !found {
-							results = append(results, node.Record{Key: k, Value: v})
-						}
-					}
-					offset = newOffset
-				}
-			}
-		}
-	}
-
-	return results, nil
-}
-
-// compare compares two byte slices
-func compare(a, b []byte) int {
-	for i := 0; i < len(a) && i < len(b); i++ {
-		if a[i] < b[i] {
-			return -1
-		} else if a[i] > b[i] {
-			return 1
-		}
-	}
-	if len(a) < len(b) {
-		return -1
-	} else if len(a) > len(b) {
-		return 1
-	}
 	return 0
 }
 
-// Private helper methods
-
-// traverse traverses the tree to find the leaf page ID for a given key.
-func (t *BfTree) traverse(key []byte) uint64 {
-	current := t.root
-	version := current.AcquireReadLock()
-	defer current.ReleaseReadLock()
-
-	// Traverse inner nodes until we reach the leaf level
-	for {
-		childIdx := current.Search(key)
-
-		// Check if we should read the next inner node or go to leaf
-		if childIdx >= len(current.Children) || current.Children[childIdx] == nil {
-			// We've reached the leaf level
-			if childIdx >= len(current.LeafPageIDs) {
-				return 0
-			}
-			return current.LeafPageIDs[childIdx]
-		}
-
-		// Move to next inner node
-		nextNode := current.Children[childIdx]
-		if !nextNode.ValidateReadLock(version) {
-			// Version mismatch, retry
-			return t.traverse(key)
-		}
-
-		version = nextNode.AcquireReadLock()
-		current.ReleaseReadLock()
-		current = nextNode
-	}
-}
-
-// getOrCreateMiniPage returns the mini-page for the given leaf page ID,
-// creating one if it doesn't exist. Allocates kvData from circular buffer.
-func (t *BfTree) getOrCreateMiniPage(leafPageID uint64) *node.MiniPage {
+func (t *BfTree[K, V]) getOrCreateMiniPage(leafPageID uint64) *node.MiniPage[K, V] {
 	// Check if mini-page already exists
 	if mp, ok := t.miniPages.Load(leafPageID); ok {
-		return mp.(*node.MiniPage)
+		return mp.(*node.MiniPage[K, V])
 	}
 
 	// Check if we need to evict before creating new mini-page
@@ -483,15 +403,15 @@ func (t *BfTree) getOrCreateMiniPage(leafPageID uint64) *node.MiniPage {
 		chunk, err = t.bufferPool.Alloc(initialSize)
 		if err != nil {
 			// Fall back to heap allocation (graceful degradation)
-			mp := node.NewMiniPage(leafPageID, initialSize)
+			mp := node.NewMiniPage(leafPageID, initialSize, t.codecs)
 			actual, _ := t.miniPages.LoadOrStore(leafPageID, mp)
 			atomic.AddUint64(&t.totalMiniPageSize, initialSize)
-			return actual.(*node.MiniPage)
+			return actual.(*node.MiniPage[K, V])
 		}
 	}
 
 	// Create mini-page with buffer-allocated kvData
-	mp := t.createMiniPageFromChunk(leafPageID, chunk)
+	mp := node.NewMiniPage(leafPageID, initialSize, t.codecs)
 
 	// Store in maps
 	actual, _ := t.miniPages.LoadOrStore(leafPageID, mp)
@@ -500,21 +420,10 @@ func (t *BfTree) getOrCreateMiniPage(leafPageID uint64) *node.MiniPage {
 	// Track size
 	atomic.AddUint64(&t.totalMiniPageSize, initialSize)
 
-	return actual.(*node.MiniPage)
+	return actual.(*node.MiniPage[K, V])
 }
 
-// createMiniPageFromChunk creates a mini-page using data from a circular buffer chunk
-func (t *BfTree) createMiniPageFromChunk(leafPageID uint64, chunk *buffer.MemoryChunk) *node.MiniPage {
-	metaSize := uint32(binary.Size(&node.NodeMeta{}))
-	usableSize := uint32(chunk.Size - uint64(metaSize))
-
-	// Create mini-page backed by buffer chunk (kvData is a slice into the chunk)
-	kvDataSlice := chunk.Data[metaSize : metaSize+usableSize]
-	return node.NewMiniPageFromBuffer(leafPageID, kvDataSlice, chunk.Size)
-}
-
-// growMiniPageInBuffer grows a mini-page with new buffer allocation.
-func (t *BfTree) growMiniPageInBuffer(leafPageID uint64, mp *node.MiniPage, newSize uint32) {
+func (t *BfTree[K, V]) growMiniPageInBuffer(leafPageID uint64, mp *node.MiniPage[K, V], newSize uint32) {
 	oldSize := mp.Meta.NodeSize
 	if newSize <= oldSize {
 		return
@@ -535,22 +444,12 @@ func (t *BfTree) growMiniPageInBuffer(leafPageID uint64, mp *node.MiniPage, newS
 		}
 	}
 
-	// Copy old kvData to new chunk
-	oldData := mp.KvData
-	usedDataLen := mp.GetDataUsed() // Get how much data is actually used
-	metaSize := uint32(binary.Size(&node.NodeMeta{}))
-	newKvData := newChunk.Data[metaSize : metaSize+usedDataLen]
-	copy(newKvData, oldData[:usedDataLen]) // Only copy used data
-
 	// Deallocate old chunk if it exists
 	if oldChunkIface, ok := t.miniPageChunks.Load(leafPageID); ok {
 		t.bufferPool.Dealloc(oldChunkIface.(*buffer.MemoryChunk))
 	}
 
-	// Update mini-page with new data backing (full new capacity)
-	newCapacity := newSize - metaSize
-	mp.KvData = newChunk.Data[metaSize : metaSize+newCapacity]
-	mp.Meta.NodeSize = newSize
+	mp.Grow(newSize)
 
 	// Store new chunk
 	t.miniPageChunks.Store(leafPageID, newChunk)
@@ -565,15 +464,14 @@ func (t *BfTree) growMiniPageInBuffer(leafPageID uint64, mp *node.MiniPage, newS
 	}
 }
 
-// evictMiniPage finds and evicts the least-recently-used mini-page to disk
-func (t *BfTree) evictMiniPage() error {
+func (t *BfTree[K, V]) evictMiniPage() error {
 	var evictPageID uint64
-	var evictMP *node.MiniPage
+	var evictMP *node.MiniPage[K, V]
 
 	// Scan mini-pages to find one with dirty records (needs persistence)
 	t.miniPages.Range(func(key, value interface{}) bool {
 		pageID := key.(uint64)
-		mp := value.(*node.MiniPage)
+		mp := value.(*node.MiniPage[K, V])
 
 		// Check if this mini-page has any records needing persistence
 		dirtyRecords := mp.GetDirtyRecords()
@@ -599,7 +497,7 @@ func (t *BfTree) evictMiniPage() error {
 		if chunkIface, ok := t.miniPageChunks.LoadAndDelete(evictPageID); ok {
 			t.bufferPool.Dealloc(chunkIface.(*buffer.MemoryChunk))
 		}
-		atomic.AddUint64(&t.totalMiniPageSize, ^(evictedSize - 1)) // Subtract size
+		atomic.AddUint64(&t.totalMiniPageSize, ^(evictedSize-1))
 		return nil
 	}
 
@@ -617,8 +515,8 @@ func (t *BfTree) evictMiniPage() error {
 	// Update the merged mini-page and handle splits
 	evictedSize := uint64(evictMP.Meta.NodeSize)
 	newSize := uint64(result.LeftPage.Meta.NodeSize)
-	atomic.AddUint64(&t.totalMiniPageSize, ^(evictedSize-1)) // Subtract old size
-	atomic.AddUint64(&t.totalMiniPageSize, newSize)          // Add new size
+	atomic.AddUint64(&t.totalMiniPageSize, ^(evictedSize-1))
+	atomic.AddUint64(&t.totalMiniPageSize, newSize)
 	t.miniPages.Store(evictPageID, result.LeftPage)
 
 	if result.RightPage != nil {
@@ -634,61 +532,27 @@ func (t *BfTree) evictMiniPage() error {
 	return nil
 }
 
-// allocatePageID allocates a new page ID.
-func (t *BfTree) allocatePageID() uint64 {
-	return atomic.AddUint64(&t.nextPageID, 1)
-}
-
-// Close closes the tree and releases resources
-func (t *BfTree) Close() error {
-	if t.store != nil {
-		return t.store.Close()
-	}
-	return nil
-}
-
-// splitRootIfFull splits the root node if it exceeds capacity
-func (t *BfTree) splitRootIfFull() {
+func (t *BfTree[K, V]) splitRootIfFull() {
 	if !t.root.IsFull() {
-		return // Root not full, no split needed
+		return
 	}
 
-	// Split the current root
 	splitKey, rightNode := t.root.Split()
-	if splitKey == nil || rightNode == nil {
-		return // Split failed
+	if rightNode == nil {
+		return
 	}
 
-	// Create a new root node with proper structure
-	newRoot := &node.InnerNode{
-		Meta: &node.NodeMeta{
-			PageType:  0, // Inner node
-			SplitFlag: 0,
-			RecordCnt: 1,
-		},
-		Keys:        [][]byte{splitKey},
-		Children:    []*node.InnerNode{t.root, rightNode},
-		LeafPageIDs: []uint64{t.root.LeafPageIDs[0], rightNode.LeafPageIDs[0]},
-		Version:     0,
-	}
+	newRoot := node.NewInnerNode(t.codecs.Compare)
+	newRoot.Keys = append(newRoot.Keys, splitKey)
+	newRoot.Children = append(newRoot.Children, t.root)
+	newRoot.Children = append(newRoot.Children, rightNode)
+	newRoot.LeafPageIDs = append(newRoot.LeafPageIDs, t.root.LeafPageIDs[0])
+	newRoot.LeafPageIDs = append(newRoot.LeafPageIDs, rightNode.LeafPageIDs[0])
+	newRoot.Meta.RecordCnt = 1
 
-	// Update tree root
 	t.root = newRoot
 }
 
-// Stats returns statistics about the tree.
-func (t *BfTree) Stats() map[string]interface{} {
-	return map[string]interface{}{
-		"next_page_id": atomic.LoadUint64(&t.nextPageID),
-		"mini_pages_count": countMiniPages(t),
-	}
-}
-
-func countMiniPages(t *BfTree) int {
-	count := 0
-	t.miniPages.Range(func(key, value interface{}) bool {
-		count++
-		return true
-	})
-	return count
+func (t *BfTree[K, V]) allocatePageID() uint64 {
+	return atomic.AddUint64(&t.nextPageID, 1)
 }

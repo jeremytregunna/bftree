@@ -9,6 +9,32 @@ import (
 	"github.com/jeremytregunna/bftree/pkg/storage"
 )
 
+// stringCodecs creates codecs for string key/value pairs
+func stringCodecs() *node.Codecs[string, string] {
+	return &node.Codecs[string, string]{
+		Compare: func(a, b string) int {
+			if a < b {
+				return -1
+			} else if a > b {
+				return 1
+			}
+			return 0
+		},
+		MarshalKey: func(k string) []byte {
+			return []byte(k)
+		},
+		UnmarshalKey: func(b []byte) (string, error) {
+			return string(b), nil
+		},
+		MarshalValue: func(v string) []byte {
+			return []byte(v)
+		},
+		UnmarshalValue: func(b []byte) (string, error) {
+			return string(b), nil
+		},
+	}
+}
+
 func TestMergeSimple(t *testing.T) {
 	// Create temporary storage
 	tmpFile, err := os.CreateTemp("", "bftree-merger-*.db")
@@ -24,24 +50,24 @@ func TestMergeSimple(t *testing.T) {
 	}
 	defer store.Close()
 
-	merger := NewMerger(store)
+	m := NewMerger[string, string](store, stringCodecs())
 
 	// Create initial leaf page with one record
-	initialRecords := []node.Record{
-		{Key: []byte("key1"), Value: []byte("value1")},
+	initialRecords := []node.Record[string, string]{
+		{Key: "key1", Value: "value1", Type: node.Cache},
 	}
-	initialPageData := serializeRecords(initialRecords)
+	initialPageData := m.serializeRecords(initialRecords)
 	leafOffset, err := store.WritePage(initialPageData)
 	if err != nil {
 		t.Fatalf("failed to write initial page: %v", err)
 	}
 
-	// Create mini-page with update
-	miniPage := node.NewMiniPage(1, 64)
-	miniPage.Insert([]byte("key1"), []byte("updated_value1"))
+	// Create mini-page with update (use 4KB to have enough space)
+	miniPage := node.NewMiniPage[string, string](1, 4096, stringCodecs())
+	miniPage.Insert("key1", "updated_value1")
 
 	// Merge
-	result, err := merger.MergeMiniPageToDisk(miniPage, leafOffset)
+	result, err := m.MergeMiniPageToDisk(miniPage, leafOffset)
 	if err != nil {
 		t.Fatalf("merge failed: %v", err)
 	}
@@ -52,14 +78,15 @@ func TestMergeSimple(t *testing.T) {
 	}
 
 	// Verify the merged page has the updated value
-	_, found := result.LeftPage.Search([]byte("key1"))
+
+	_, found := result.LeftPage.Search("key1")
 	if !found {
 		t.Fatal("expected to find key1 after merge")
 	}
 
-	value, found := result.LeftPage.Search([]byte("key1"))
-	if !found || string(value) != "updated_value1" {
-		t.Fatalf("expected updated_value1, got %v", string(value))
+	value, found := result.LeftPage.Search("key1")
+	if !found || value != "updated_value1" {
+		t.Fatalf("expected updated_value1, got %v", value)
 	}
 }
 
@@ -78,37 +105,37 @@ func TestMergeWithDelete(t *testing.T) {
 	}
 	defer store.Close()
 
-	merger := NewMerger(store)
+	m := NewMerger[string, string](store, stringCodecs())
 
 	// Create initial leaf page
-	initialRecords := []node.Record{
-		{Key: []byte("key1"), Value: []byte("value1")},
-		{Key: []byte("key2"), Value: []byte("value2")},
+	initialRecords := []node.Record[string, string]{
+		{Key: "key1", Value: "value1", Type: node.Cache},
+		{Key: "key2", Value: "value2", Type: node.Cache},
 	}
-	initialPageData := serializeRecords(initialRecords)
+	initialPageData := m.serializeRecords(initialRecords)
 	leafOffset, err := store.WritePage(initialPageData)
 	if err != nil {
 		t.Fatalf("failed to write initial page: %v", err)
 	}
 
-	// Create mini-page with delete
-	miniPage := node.NewMiniPage(1, 64)
-	miniPage.InsertWithType([]byte("key1"), nil, node.Tombstone)
+	// Create mini-page with delete (use 4KB to have enough space)
+	miniPage := node.NewMiniPage[string, string](1, 4096, stringCodecs())
+	miniPage.InsertWithType("key1", "", node.Tombstone)
 
 	// Merge
-	result, err := merger.MergeMiniPageToDisk(miniPage, leafOffset)
+	result, err := m.MergeMiniPageToDisk(miniPage, leafOffset)
 	if err != nil {
 		t.Fatalf("merge failed: %v", err)
 	}
 
 	// Verify key1 is deleted
-	_, found := result.LeftPage.Search([]byte("key1"))
+	_, found := result.LeftPage.Search("key1")
 	if found {
 		t.Fatal("expected key1 to be deleted")
 	}
 
 	// Verify key2 still exists
-	_, found = result.LeftPage.Search([]byte("key2"))
+	_, found = result.LeftPage.Search("key2")
 	if !found {
 		t.Fatal("expected key2 to still exist")
 	}
@@ -129,28 +156,28 @@ func TestMergeSplit(t *testing.T) {
 	}
 	defer store.Close()
 
-	merger := NewMerger(store)
+	m := NewMerger[string, string](store, stringCodecs())
 
 	// Create large leaf page that fills most of the storage page
-	var initialRecords []node.Record
+	var initialRecords []node.Record[string, string]
 	for i := 0; i < 50; i++ {
-		key := []byte(fmt.Sprintf("key%03d", i))
-		value := make([]byte, 40) // Larger values to fill space
-		initialRecords = append(initialRecords, node.Record{Key: key, Value: value})
+		key := fmt.Sprintf("key%03d", i)
+		value := fmt.Sprintf("val%040d", i) // Larger values to fill space
+		initialRecords = append(initialRecords, node.Record[string, string]{Key: key, Value: value, Type: node.Cache})
 	}
 
-	initialPageData := serializeRecords(initialRecords)
+	initialPageData := m.serializeRecords(initialRecords)
 	leafOffset, err := store.WritePage(initialPageData)
 	if err != nil {
 		t.Fatalf("failed to write initial page: %v", err)
 	}
 
 	// Create mini-page with more inserts to cause split (exceeds page size)
-	miniPage := node.NewMiniPage(1, 64)
+	miniPage := node.NewMiniPage[string, string](1, 4096, stringCodecs())
 	insertedCount := 0
 	for i := 50; i < 100; i++ {
-		key := []byte(fmt.Sprintf("key%03d", i))
-		value := make([]byte, 40) // Same size values
+		key := fmt.Sprintf("key%03d", i)
+		value := fmt.Sprintf("val%040d", i) // Same size values
 
 		// Try to insert, grow if needed (matching tree behavior)
 		success := false
@@ -179,7 +206,7 @@ func TestMergeSplit(t *testing.T) {
 	t.Logf("Mini-page has %d records", len(miniPageRecords))
 
 	// Merge - should trigger split
-	result, err := merger.MergeMiniPageToDisk(miniPage, leafOffset)
+	result, err := m.MergeMiniPageToDisk(miniPage, leafOffset)
 	if err != nil {
 		t.Fatalf("merge failed: %v", err)
 	}
@@ -189,7 +216,7 @@ func TestMergeSplit(t *testing.T) {
 		t.Fatal("expected split to occur but got no right page")
 	}
 
-	if len(result.SplitKey) == 0 {
+	if result.SplitKey == "" {
 		t.Fatal("expected split key")
 	}
 
@@ -202,15 +229,16 @@ func TestMergeSplit(t *testing.T) {
 	}
 
 	// Verify split key separates them
+	codecs := stringCodecs()
 	for _, rec := range leftRecords {
-		if compare(rec.Key, result.SplitKey) >= 0 {
-			t.Fatalf("left page key %s should be < split key %s", string(rec.Key), string(result.SplitKey))
+		if codecs.Compare(rec.Key, result.SplitKey) >= 0 {
+			t.Fatalf("left page key %s should be < split key %s", rec.Key, result.SplitKey)
 		}
 	}
 
 	for _, rec := range rightRecords {
-		if compare(rec.Key, result.SplitKey) < 0 {
-			t.Fatalf("right page key %s should be >= split key %s", string(rec.Key), string(result.SplitKey))
+		if codecs.Compare(rec.Key, result.SplitKey) < 0 {
+			t.Fatalf("right page key %s should be >= split key %s", rec.Key, result.SplitKey)
 		}
 	}
 }
